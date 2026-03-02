@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from typing import Optional, Tuple
 from transformers import PretrainedConfig
 
 
-class MokioMindConfig(PretrainedConfig):
+class MiniMindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
     def __init__(
@@ -114,6 +115,10 @@ def precompute_freqs(
     
     beta = beta_slow + (beta_fast - beta_slow) * power
     
+    """
+    [0, corr_dim): scale_i = (beta_i * factor - beta_i + 1)/ (beta_i * factor)
+    [corr_dim, dim//2): scale_i = 1 / factor
+    """
     scale = torch.where(
         torch.arange(dim // 2, device=freqs.device) < corr_dim,
         (beta * factor - beta + 1) / (beta * factor),
@@ -142,3 +147,86 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1) -> 
     
     return q_embed, k_embed
 
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, seq_len, num_heads, head_dim = x.shape
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, seq_len, num_heads, n_rep, head_dim)
+        .reshape(bs, seq_len, num_heads * n_rep, head_dim)
+    )
+
+class Attention(nn.Module):
+    def __init__(self, args: MiniMindConfig):
+        super().__init__()
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+        self.n_local_heads = args.num_attention_heads
+        self.local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.local_kv_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+        self.q_proj = nn.Linear(args.hidden_size, self.n_local_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.local_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.local_kv_heads * self.head_dim, bias=False)
+        self.out_proj = nn.Linear(args.n_local_heads * self.head_dim, args.hidden_size, bias=False)
+        
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
+        
+    def forward(self,
+                x: torch.Tensor,
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                use_cache: bool = False,
+                attention_mask: Optional[torch.Tensor] = None,):
+        bs, seq_len, _ = x.shape
+        
+        # 线性变换得到 q, k, v
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q = q.view(bs, seq_len, self.n_local_heads, self.head_dim)
+        k = k.view(bs, seq_len, self.local_kv_heads, self.head_dim)
+        v = v.view(bs, seq_len, self.local_kv_heads, self.head_dim)
+        
+        cos, sin = position_embeddings
+        # 应用旋转位置编码
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        # kv_cache 处理
+        if past_key_value is not None:
+            k = torch.cat([past_key_value[0], k], dim=1)
+            v = torch.cat([past_key_value[1], v], dim=1)
+        past_kv = (k, v) if use_cache else None
+        
+        q, k, v = (
+            q.transpose(1, 2),
+            repeat_kv(k, self.n_rep).transpose(1, 2),
+            repeat_kv(v, self.n_rep).transpose(1, 2),
+        )
+        
+        if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True
+            )
+        else:
+            # [bs, nheads, seqlen, seqlen_kv]
+            scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+            causal_mask = torch.full([seq_len, seq_len], float("-inf"), device=x.device).triu(diagonal=1)
+            scores[..., -seq_len:] += scores.unsqueeze(0).unsqueeze(0)
+        
+        if attention_mask is not None:
+            # [bs, seqlen_k] -> [bs, 1, 1, seqlen_k]
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            # 1 表示 attend, 0 表示不 attend，乘以一个很大的负数（-1e9）使得 softmax 后接近于0
+            extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+            scores = scores + extended_attention_mask
+            
+        scores = F.softmax(scores.float(), dim=-1).type_as(x)
+        scores = self.attn_dropout(scores)
+        output = scores @ v
+        
+        output = output.transpose(1, 2).reshape(bs, seq_len, -1)
+        output = self.out_proj(output)
+        output = self.resid_dropout(output)
+        
+        return output, past_kv

@@ -13,8 +13,8 @@ from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from model.model_minimind import MiniMindConfig
-from dataset.lm_dataset import PretrainDataset
+from model.model import MiniMindConfig
+from dataset.lm_dataset import PretrainedDataset
 from trainer.trainer_utils import (
     get_lr,
     Logger,
@@ -32,7 +32,7 @@ warnings.filterwarnings("ignore")
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start_step + 1):
-        loss_fn = nn.CrossEntropyLoss(reduce="none")
+        loss_fn = nn.CrossEntropyLoss(reduce="mean")
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -42,6 +42,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         # 混合精度训练
         with autocast_ctx:
             res = model(input_ids=input_ids, labels=labels)
+            # input_ids[..., :-1]对应预测的token，labels[..., 1:]对应正确的token，shift one token for input and labels
             loss = loss_fn(
                 input=res.logits[..., :-1, :].view(-1, res.logits.size(-1)),
                 target=labels[..., 1:].view(-1),
@@ -221,7 +222,7 @@ if __name__ == "__main__":
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger("torch.compile enabled")
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    train_ds = PretrainedDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler(enabled=(args.dtype == "float16"))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)

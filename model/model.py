@@ -6,6 +6,8 @@ import math
 from typing import Optional, Tuple, List, Union
 from transformers import GenerationMixin, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
+import torch.autograd.profiler as profiler
+from torch.profiler import profile, record_function, ProfilerActivity
 
 
 class MiniMindConfig(PretrainedConfig):
@@ -295,6 +297,322 @@ class FeedForward(nn.Module):
         )
 
 
+# 专家模块
+class Expert(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        # 双层 MLP：Linear→GELU→Linear
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),  # 比 ReLU 更平滑的激活函数
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)  # 前向传播
+
+
+# MoE 核心模块 Switch-Transformer
+class MoE(nn.Module):
+    def __init__(
+        self, input_dim, num_experts, top_k, expert_capacity, hidden_dim, output_dim
+    ):
+        super().__init__()
+        self.num_experts = num_experts  # 专家数量：需根据任务复杂度调整（如简单任务 4-8 个，复杂任务 16-32 个）
+        self.top_k = top_k  # 每个样本激活的专家数：核心稀疏参数，通常取 1-4（K=2 是兼顾效率与性能的常用值）
+        self.expert_capacity = (
+            expert_capacity  # 单个专家最大处理样本数：避免“热门专家”过载导致 OOM
+        )
+
+        # 路由门控网络：输入 x→输出各专家的匹配度（logits），维度为[batch_size, num_experts]
+        self.gate = nn.Linear(
+            input_dim, num_experts
+        )  # 线性层是门控的极简实现，复杂场景可替换为 Transformer 层
+
+        # 创建专家集合：用 nn.ModuleList 管理，支持自动参数注册与设备迁移
+        self.experts = nn.ModuleList(
+            [Expert(input_dim, hidden_dim, output_dim) for _ in range(num_experts)]
+        )
+
+    def forward(self, x):
+        batch_size, input_dim = x.shape
+        device = x.device
+
+        # 1. 路由计算：完成“输入→专家匹配概率→Top-K 专家选择”
+        with profiler.record_function("MoE_Routing"):
+            logits = self.gate(
+                x
+            )  # [batch_size, num_experts]：门控输出各专家的原始匹配度（无范围约束）
+            probs = torch.softmax(
+                logits, dim=-1
+            )  # 将 logits 归一化为 0-1 概率：确保路由权重可解释（概率越高越匹配）
+            topk_probs, topk_indices = torch.topk(
+                probs, self.top_k, dim=-1
+            )  # 取 Top-K 专家：实现稀疏激活，降低计算量
+
+        # 2. 负载均衡损失（仅训练时）：防止专家闲置，确保模型充分利用容量
+        if self.training:
+            with profiler.record_function("MoE_Auxloss"):
+                # [n_experts]
+                importance = probs.sum(
+                    0
+                )  # [num_experts]：每个专家的总路由概率（反映整体重要性）
+                importance_loss = torch.var(importance) / (
+                    self.num_experts**2
+                )  # 归一化方差：避免数值过大
+
+                # 创建 Top-K 掩码：标记哪些专家被选中（用于过滤未选中的专家概率）
+                # [N, n_experts]
+                mask = torch.zeros_like(probs, dtype=torch.bool)
+                mask.scatter_(
+                    1, topk_indices, True
+                )  # scatter_：按 topk_indices 将 mask 对应位置设为 True
+                routing_probs = (
+                    probs * mask
+                )  # [batch_size, num_experts]：仅保留选中专家的概率
+                expert_usage = mask.float().mean(
+                    0
+                )  # [num_experts]：专家使用率（分配样本占比）
+                routing_weights = routing_probs.mean(
+                    0
+                )  # [num_experts]：专家的平均路由权重（分配样本的依赖度）
+                load_balance_loss = (
+                    self.num_experts * (expert_usage * routing_weights).sum()
+                )  # 归一化损失
+
+                aux_loss = (
+                    importance_loss + load_balance_loss
+                )  # 总辅助损失：与主任务损失加权求和
+        else:
+            aux_loss = 0.0  # 推理时无需更新参数，关闭负载均衡损失
+
+        # 3. 专家分配逻辑：建立“样本-选中专家”的映射关系，便于按专家分组计算
+        flat_indices = topk_indices.view(
+            -1
+        )  # [batch_size*top_k]：展平专家索引（如[0,1,2,3]→[0,2,1,3]）
+        flat_probs = topk_probs.view(
+            -1
+        )  # [batch_size*top_k]：展平专家权重（与索引一一对应）
+
+        # 展平样本索引：每个样本对应 top_k 个专家，需标记每个专家索引属于哪个样本
+        sample_indices = (
+            torch.arange(batch_size, device=device)[:, None]
+            .expand(-1, self.top_k)
+            .flatten()
+        )  # [batch_size*top_k]：如样本 0 对应[0,0]，展平后为[0,0]
+
+        # 4. 专家并行计算：按专家分组处理样本，独立计算后聚合结果
+        # 获取输出维度：所有专家输出维度一致，取第一个专家的输出维度即可
+        output_dim = self.experts[0].net[-1].out_features
+        outputs = torch.zeros(batch_size, output_dim, device=device)  # 初始化输出张量
+
+        with profiler.record_function("MoE_Experts"):
+            for expert_idx in range(self.num_experts):
+                # 找到分配给当前专家的样本：通过掩码筛选出属于该专家的样本索引
+                expert_mask = (
+                    flat_indices == expert_idx
+                )  # [batch_size*top_k]：True 表示属于当前专家
+                expert_samples = sample_indices[expert_mask]  # 属于当前专家的样本 ID
+                expert_weights = flat_probs[expert_mask]  # 这些样本对当前专家的权重
+
+                # 容量控制（丢弃超额样本）：避免单个专家处理过多样本导致计算过载或 OOM
+                if len(expert_samples) > self.expert_capacity:
+                    expert_samples = expert_samples[
+                        : self.expert_capacity
+                    ]  # 截断至最大容量
+                    expert_weights = expert_weights[: self.expert_capacity]
+
+                if len(expert_samples) == 0:
+                    continue  # 无样本分配给当前专家，跳过计算
+
+                # 专家计算并加权输出：按公式 y=sum(w_i*E_i(x))，先计算单个专家的加权输出
+                expert_output = self.experts[expert_idx](
+                    x[expert_samples]
+                )  # [num_samples, output_dim]：专家处理样本
+                weighted_output = expert_output * expert_weights.unsqueeze(
+                    -1
+                )  # 权重广播到输出维度（匹配维度后相乘）
+
+                # 聚合结果：将当前专家的加权输出累加到对应样本的位置（一个样本会累加 K 个专家的输出）
+                outputs.index_add_(
+                    0, expert_samples, weighted_output
+                )  # index_add_：按样本 ID 累加，避免循环赋值
+
+        return outputs, aux_loss
+
+
+class MoEGate(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_prob = config.norm_topk_prob
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(
+            torch.empty([self.n_routed_experts, self.gating_dim])
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_normal_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states):
+        bs, seq_len, hidden_size = hidden_states.shape
+        # [bs*seq_len, hidden_size]
+        hidden_states = hidden_states.view(-1, hidden_size)
+
+        # [bs*seq_len, n_routed_experts]
+        logits = F.linear(hidden_states, self.weight)
+        # softmax
+        if self.scoring_func == "softmax":
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+
+        # Top_k select
+        # [bs*seq_len, top_k]
+        topk_weight, topk_idx = torch.topk(scores, self.top_k, dim=-1)
+
+        # Normalize topk scores if needed
+        if self.top_k > 1 and self.norm_topk_prob:
+            topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+
+        # Compute auxiliary loss
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores
+            # [bs*seq_len, top_k] -> [bs, seq_len*top_k]
+            topk_idx_for_aux_loss = topk_idx.view(bs, -1)
+            # 序列级辅助损失
+            if self.seq_aux:
+                # 计算每个专家的相对负载率
+                # 1. 计算每个专家被选中的次数[bs, n_routed_experts]
+                # 2. 计算每个专家被选中的理想次数=seq_len * topk / n_routed_experts
+                expert_selection_count = torch.zeros(
+                    [bs, self.n_routed_experts], device=hidden_states.device
+                )
+
+                expert_selection_count.scatter_add_(
+                    dim=1,
+                    index=topk_idx_for_aux_loss,
+                    src=torch.ones_like(topk_idx_for_aux_loss),
+                ).div_(seq_len * self.top_k / self.n_routed_experts)
+                # 计算每个专家的路由概率平均值[bs, n_routed_experts]
+                # [bs*seq_len, n_routed_experts] -> [bs, seq_len, n_routed_experts] -> [bs, n_routed_experts]
+                scores_for_aux = scores_for_aux.view(bs, seq_len, -1).mean(dim=1)
+
+                aux_loss = (expert_selection_count * scores_for_aux).sum(
+                    1
+                ).mean() * self.alpha
+            # 批级辅助损失
+            else:
+                # 计算全局每个专家的相对负载率
+                # 1. 计算全局每个专家的平均选择率
+                # 2. 乘以n_experts得到每个专家的相对负载因子
+                expert_selection_count = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                # [bs*seq_len*top_k, n_routed_experts] -> [n_routed_experts]
+                ce = expert_selection_count.float().mean(0)
+                Pi = scores_for_aux.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = scores.new_zeros(1).squeeze()
+
+        return topk_idx, topk_weight, aux_loss
+
+
+class MoEFeedForward(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.experts = nn.ModuleList(
+            [FeedForward(config) for _ in range(config.n_routed_experts)]
+        )
+
+        self.gate = MoEGate(config)
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList(
+                [FeedForward(config) for _ in range(config.n_shared_experts)]
+            )
+
+    def forward(self, x):
+        original = x
+        original_shape = x.shape
+        bs, seq_len, _ = x.shape
+        # [bs*seq_len, topk]
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        # [bs*seq_len, hidden_size]
+        x = x.view(-1, x.shape[-1])
+
+        # [bs*seq_len*topk]
+        flat_topk_idx = topk_idx.view(-1)
+        if self.training:
+            # [bs*seq_len, hidden_size] -> [bs*seq_len*topk, hidden_size]
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            y = torch.empty_like(x)
+            for i, expert in enumerate(self.experts):
+                expert_out = expert(x[flat_topk_idx == i])
+                if expert_out.shape[0] > 0:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype)
+                else:
+                    y[flat_topk_idx == i] = expert_out + 0 * sum(
+                        p.sum() for p in expert.parameters()
+                    )
+                y = y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1).sum(1)
+                y = y.view(*original_shape)
+        else:
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
+                *original_shape
+            )
+        if self.config.n_shared_experts > 0:
+            for expert in range(self.shared_experts):
+                y = y + expert(original)
+        self.aux_loss = aux_loss
+        return y
+
+    @torch.no_grad()
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        """
+        x: [N, D]
+        flat_expert_indices: [N * top_k] [2, 0, 1, 2, 0, 3], 3个专家, topk=2, N=3
+        flat_expert_weights: [N * top_k, 1]
+        """
+        expert_cache = torch.zeros_like(x)
+
+        # [1, 4, 2, 0, 3, 5]
+        idxs = flat_expert_indices.argsort()
+        # [2, 1, 2, 1] -> [2, 3, 5, 6]
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # [0, 2, 1, 0, 1, 2]
+        token_idxs = idxs // self.config.num_experts_per_tok
+        for i, end_idx in enumerate(tokens_per_expert):
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+
+            expert = self.experts[i]
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            expert_tokens = x[exp_token_idx]
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            expert_cache.scatter_add_(
+                dim=0,
+                index=exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]),
+                src=expert_out,
+            )
+
+        return expert_cache
+
+
 class MiniBlock(nn.Module):
     def __init__(self, layer_id: int, args: MiniMindConfig):
         super().__init__()
@@ -306,7 +624,7 @@ class MiniBlock(nn.Module):
         self.layer_id = layer_id
         self.input_layernorm = RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
         self.post_layernorm = RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
-        self.mlp = FeedForward(args) if not args.use_moe else MOEFeedForward(args)
+        self.mlp = FeedForward(args) if not args.use_moe else MoEFeedForward(args)
 
     def forward(
         self,

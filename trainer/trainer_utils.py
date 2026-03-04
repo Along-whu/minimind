@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
-from model.model_minimind import MiniMindForCausalLM
+from model.model import MiniMindForCausalLM
 
 
 def get_model_params(model, config):

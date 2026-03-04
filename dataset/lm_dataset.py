@@ -27,6 +27,7 @@ class PretrainedDataset(Dataset):
 
         input_ids = torch.tensor(tokens, dtype=torch.long)
         labels = input_ids.clone()
+        # nn.CrossEntropyLoss默认忽略标签为-100的token，因此将padding token的标签设置为-100
         labels[
             input_ids == self.tokenizer.pad_token_id
         ] = -100  # Ignore padding tokens in loss computation

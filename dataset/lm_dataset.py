@@ -128,8 +128,43 @@ class SFTDataset(Dataset):
         prompt = post_processing_chat(prompt)
         input_ids = self.tokenizer(prompt).input_ids[: self.max_length]
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        # 将非答案部分设置为-100
         labels = self.generate_labels(input_ids)
 
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(
             labels, dtype=torch.long
         )
+
+
+class RLAIFDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer):
+        self.tokenizer = tokenizer
+        self.samples = []
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                self.samples.append(json.loads(line))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+
+        conversations = sample["conversations"]
+
+        messages = []
+        answer = ""
+
+        for i, turn in enumerate(conversations):
+            role = "user" if i % 2 == 0 else "assistant"
+
+            messages.appen({"role": role, "content": turn["content"]})
+            answer = turn["content"]
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages[:-1],  # Cut answer
+            tokenize=False,
+            add_generation_prompt=True,  # generate assistant
+        )
+
+        return {"prompt": prompt, "answer": answer}

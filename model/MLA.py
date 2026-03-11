@@ -279,7 +279,7 @@ class MLA_vLLM(nn.Module):
         k_full = k_full.unsqueeze(2).transpose(1, 2) # [bs, 1, kvl, kv_lora_rank + q_rope]
         
         new_kv_latent = new_kv_latent.unsqueeze(2).transpose(1, 2) # [bs, 1, kvl, kv_lora_rank]
-        scores = q_nope_absorbed @ k_full.transpose(-2, -1) * 1.0 / math.sqrt(self.kv_lora_rank + self.qk_rope_head_dim)# [bs, h, seq_len, kvl]
+        scores = q_nope_absorbed @ k_full.transpose(-2, -1) * 1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)# [bs, h, seq_len, kvl]
         scores = F.softmax(scores, dim=-1)
         
         attn_out = scores @ new_kv_latent # [bs, h, seq_len, kv_lora_rank]
